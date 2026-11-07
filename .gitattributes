@@ -1,0 +1,8 @@
+* text=auto
+
+# Батники должны быть с CRLF, иначе cmd.exe спотыкается
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.py text eol=lf
+*.md text eol=lf
