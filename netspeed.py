@@ -621,7 +621,8 @@ class SpeedTest(threading.Thread):
         self._up_seconds = max(0.0, up_seconds)
         self._streams_down = max(1, streams_down)
         self._streams_up = max(1, streams_up)
-        self._stop = threading.Event()
+        self._stop = threading.Event()   # общая отмена: гасит все фазы
+        self._user_cancel = False
         self._errors: List[str] = []
         self._err_lock = threading.Lock()
         self._ctx = ssl.create_default_context()
@@ -665,12 +666,13 @@ class SpeedTest(threading.Thread):
             return 0.0
         return max(0.0, (cls._cum_at(samples, b) - cls._cum_at(samples, a)) / (b - a))
 
-    def _measure(self, phase: str, counter: _Counter, seconds: float) -> Tuple[float, float, int]:
+    def _measure(self, phase: str, counter: _Counter, seconds: float,
+                 stop: threading.Event) -> Tuple[float, float, int]:
         """Крутится `seconds` секунд, отдавая прогресс. Возвращает (среднее, пик за 1 с, байт)."""
         t0 = time.perf_counter()
         samples: List[Tuple[float, int]] = [(0.0, 0)]
         while True:
-            if self._stop.wait(0.2):
+            if stop.wait(0.2) or self._stop.is_set():
                 break
             t = time.perf_counter() - t0
             samples.append((t, counter.total))
@@ -719,8 +721,10 @@ class SpeedTest(threading.Thread):
         return None
 
     # ---------- рабочие потоки ----------
-    def _down_worker(self, host: str, path: str, per: int, counter: _Counter) -> None:
-        while not self._stop.is_set():
+    def _down_worker(self, host: str, path: str, per: int, counter: _Counter,
+                     stop: threading.Event) -> None:
+        done = lambda: stop.is_set() or self._stop.is_set()
+        while not done():
             conn = None
             try:
                 conn = http.client.HTTPSConnection(host, timeout=SPEEDTEST_TIMEOUT, context=self._ctx)
@@ -730,15 +734,15 @@ class SpeedTest(threading.Thread):
                 resp = conn.getresponse()
                 if resp.status != 200:
                     raise OSError(f"HTTP {resp.status}")
-                while not self._stop.is_set():
+                while not done():
                     chunk = resp.read(SPEEDTEST_CHUNK)
                     if not chunk:
                         break
                     counter.add(len(chunk))
             except Exception as e:  # noqa: BLE001
-                if not self._stop.is_set():
+                if not done():
                     self._note(e)
-                    self._stop.wait(0.2)
+                    stop.wait(0.2)
             finally:
                 if conn is not None:
                     try:
@@ -746,9 +750,10 @@ class SpeedTest(threading.Thread):
                     except Exception:  # noqa: BLE001
                         pass
 
-    def _up_worker(self, counter: _Counter) -> None:
+    def _up_worker(self, counter: _Counter, stop: threading.Event) -> None:
         blob = _UP_BLOB
-        while not self._stop.is_set():
+        done = lambda: stop.is_set() or self._stop.is_set()
+        while not done():
             conn = None
             try:
                 conn = http.client.HTTPSConnection(SPEEDTEST_UP_HOST, timeout=SPEEDTEST_TIMEOUT,
@@ -762,7 +767,7 @@ class SpeedTest(threading.Thread):
                 if sock is None:
                     raise OSError("нет сокета")
                 sent = 0
-                while sent < SPEEDTEST_UP_BYTES and not self._stop.is_set():
+                while sent < SPEEDTEST_UP_BYTES and not done():
                     n = min(len(blob), SPEEDTEST_UP_BYTES - sent)
                     sock.sendall(blob if n == len(blob) else blob[:n])
                     sent += n
@@ -771,15 +776,28 @@ class SpeedTest(threading.Thread):
                     resp = conn.getresponse()
                     resp.read()
             except Exception as e:  # noqa: BLE001
-                if not self._stop.is_set():
+                if not done():
                     self._note(e)
-                    self._stop.wait(0.2)
+                    stop.wait(0.2)
             finally:
                 if conn is not None:
                     try:
                         conn.close()
                     except Exception:  # noqa: BLE001
                         pass
+
+    def _wait_quiet(self, counter: _Counter, limit: float = 6.0) -> bool:
+        """Дождаться, пока счётчик перестанет расти: значит, потоки фазы встали."""
+        deadline = time.perf_counter() + limit
+        last = counter.total
+        while time.perf_counter() < deadline:
+            if self._stop.wait(0.3):
+                return True
+            now = counter.total
+            if now == last:
+                return True
+            last = now
+        return False
 
     # ---------- сценарий ----------
     def run(self) -> None:
@@ -795,16 +813,24 @@ class SpeedTest(threading.Thread):
             res.source = name
 
             counter = _Counter()
+            down_stop = threading.Event()
             for _ in range(self._streams_down):
-                t = threading.Thread(target=self._down_worker, args=(host, path, per, counter),
+                t = threading.Thread(target=self._down_worker,
+                                     args=(host, path, per, counter, down_stop),
                                      daemon=True, name="speedtest-down")
                 t.start()
                 workers.append(t)
             res.down_bps, res.down_peak_bps, res.down_bytes = self._measure(
-                "download", counter, self._down_seconds)
-            self._stop.set()
+                "download", counter, self._down_seconds, down_stop)
+            down_stop.set()
             for t in workers:
                 t.join(timeout=3.0)
+            # Поток, застрявший в recv, продолжит качать и исказит замер отдачи,
+            # поэтому к следующей фазе переходим только когда загрузка реально стихла.
+            if not self._wait_quiet(counter):
+                res.error = ("Потоки загрузки не остановились вовремя, "
+                             "замер отдачи был бы неточным.")
+                return
             workers.clear()
 
             if res.down_bytes == 0:
@@ -820,17 +846,17 @@ class SpeedTest(threading.Thread):
                     log.exception("Обработчик промежуточного результата теста упал")
 
             # отдача: заново открываем «ворота» (общий stop использован для остановки загрузки)
-            if self._up_seconds > 0 and not getattr(self, "_user_cancel", False):
-                self._stop = threading.Event()
+            if self._up_seconds > 0 and not self._stop.is_set():
                 upc = _Counter()
+                up_stop = threading.Event()
                 for _ in range(self._streams_up):
-                    t = threading.Thread(target=self._up_worker, args=(upc,),
+                    t = threading.Thread(target=self._up_worker, args=(upc, up_stop),
                                          daemon=True, name="speedtest-up")
                     t.start()
                     workers.append(t)
                 res.up_bps, res.up_peak_bps, res.up_bytes = self._measure(
-                    "upload", upc, self._up_seconds)
-                self._stop.set()
+                    "upload", upc, self._up_seconds, up_stop)
+                up_stop.set()
                 for t in workers:
                     t.join(timeout=3.0)
                 workers.clear()
@@ -841,7 +867,7 @@ class SpeedTest(threading.Thread):
             self._stop.set()
             for t in workers:
                 t.join(timeout=2.0)
-            res.cancelled = bool(getattr(self, "_user_cancel", False))
+            res.cancelled = self._user_cancel
             try:
                 self._on_done(res)
             except Exception:  # noqa: BLE001
@@ -1029,9 +1055,9 @@ class SpeedTestDialog:
             self.lbl_phase.configure(text="Не получилось")
             self.lbl_note.configure(text=res.error)
             return
-        if res.cancelled and res.down_bytes == 0:
+        if res.cancelled and res.down_bps <= 0.0:
             self.lbl_phase.configure(text="Тест отменён")
-            self.lbl_note.configure(text="Результат не получен.")
+            self.lbl_note.configure(text="Остановлено слишком рано — результат не получен.")
             return
 
         self.lbl_phase.configure(text="Готово" + (" (прервано)" if res.cancelled else ""))
